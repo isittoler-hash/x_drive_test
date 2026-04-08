@@ -30,12 +30,21 @@ namespace
 {
 
   constexpr int kDriverLoopMs = 20;
+  constexpr int kControllerStatusUpdateLoops = 5;
   constexpr double kPi = 3.14159265358979323846;
   constexpr double kDeadbandPct = 5.0;
-  constexpr double kHeadingStickDeadbandPct = 20.0;
-  constexpr double kHeadingHoldKp = 0.85;
-  constexpr double kMaxHeadingHoldPct = 60.0;
-  constexpr double kHeadingHoldEngageErrorDeg = 1.0;
+  constexpr double kHeadingTurnStickDeadbandPct = 40.0;
+  constexpr double kHeadingTurnStickFilterAlpha = 0.2;
+  constexpr double kMaxManualTurnPct = 35.0;
+  constexpr double kHeadingHoldKp = 0.28;
+  constexpr double kHeadingHoldKi = 0.005;
+  constexpr double kHeadingHoldKd = 0.05;
+  constexpr double kHeadingIntegralZoneDeg = 10.0;
+  constexpr double kHeadingHoldSettleErrorDeg = 1.5;
+  constexpr double kMaxHeadingIntegralPct = 4.0;
+  constexpr double kHeadingTurnSlewPctPerLoop = 3.0;
+  constexpr double kHeadingDerivativeFilterAlpha = 0.15;
+  constexpr double kMaxHeadingHoldPct = 18.0;
 
   // These aliases define the physical wheel order for the X-drive mix.
   // If translation or heading are mirrored on the robot, update this mapping
@@ -46,7 +55,13 @@ namespace
   motor &BackRightMotor = Neg_Y;
 
   double desiredHeadingDeg = 0.0;
+  double previousTurnCommandPct = 0.0;
+  double filteredHeadingTurnStickPct = 0.0;
+  double headingIntegralDegSeconds = 0.0;
+  double previousHeadingDeg = 0.0;
+  double filteredHeadingRateDegPerSec = 0.0;
   bool headingSensorReady = false;
+  bool wasHeadingTurnInputActive = false;
   bool wasResetPressed = false;
 
   double clampValue(double value, double minValue, double maxValue)
@@ -99,6 +114,34 @@ namespace
     return std::fabs(value) < deadbandPct ? 0.0 : value;
   }
 
+  double applyScaledDeadband(double value, double deadbandPct)
+  {
+    const double magnitude = std::fabs(value);
+    if (magnitude <= deadbandPct)
+    {
+      return 0.0;
+    }
+
+    const double scaledMagnitude =
+        (magnitude - deadbandPct) * 100.0 / (100.0 - deadbandPct);
+    return std::copysign(scaledMagnitude, value);
+  }
+
+  double moveToward(double currentValue, double targetValue, double maxStep)
+  {
+    if (targetValue > currentValue + maxStep)
+    {
+      return currentValue + maxStep;
+    }
+
+    if (targetValue < currentValue - maxStep)
+    {
+      return currentValue - maxStep;
+    }
+
+    return targetValue;
+  }
+
   void spinDrive(double frontLeft, double frontRight, double backLeft,
                  double backRight)
   {
@@ -129,18 +172,47 @@ namespace
     BackRightMotor.stop(mode);
   }
 
+  void printControllerStatus(double headingDeg, double targetHeadingDeg,
+                             double headingErrorDeg, double turnCommandPct,
+                             double turnStickPct, double integralTermPct,
+                             double derivativeTermPct, bool turnInputActive,
+                             bool sensorReady)
+  {
+    Controller1.Screen.clearScreen();
+    Controller1.Screen.setCursor(1, 1);
+    if (!sensorReady)
+    {
+      Controller1.Screen.print("No inertial");
+      return;
+    }
+
+    Controller1.Screen.print("H%5.1f T%5.1f", headingDeg, targetHeadingDeg);
+    Controller1.Screen.setCursor(2, 1);
+    Controller1.Screen.print("E%5.1f U%5.1f", headingErrorDeg, turnCommandPct);
+    Controller1.Screen.setCursor(3, 1);
+    if (turnInputActive)
+    {
+      Controller1.Screen.print("RT%5.1f MAN ", turnStickPct);
+    }
+    else
+    {
+      Controller1.Screen.print("I%4.1f D%4.1f", integralTermPct,
+                               derivativeTermPct);
+    }
+  }
+
   void calibrateHeadingSensor()
   {
-    Brain.Screen.clearScreen();
-    Brain.Screen.setCursor(1, 1);
+    Controller1.Screen.clearScreen();
+    Controller1.Screen.setCursor(1, 1);
     if (!HeadingSensor.installed())
     {
-      Brain.Screen.print("Missing inertial on PORT9");
+      Controller1.Screen.print("No inertial P9");
       headingSensorReady = false;
       return;
     }
 
-    Brain.Screen.print("Calibrating inertial...");
+    Controller1.Screen.print("Calibrating...");
 
     HeadingSensor.calibrate();
     while (HeadingSensor.isCalibrating())
@@ -152,9 +224,9 @@ namespace
     desiredHeadingDeg = 0.0;
     headingSensorReady = true;
 
-    Brain.Screen.clearScreen();
-    Brain.Screen.setCursor(1, 1);
-    Brain.Screen.print("Inertial ready");
+    Controller1.Screen.clearScreen();
+    Controller1.Screen.setCursor(1, 1);
+    Controller1.Screen.print("Inertial ready");
   }
 
 } // namespace
@@ -209,50 +281,124 @@ void usercontrol(void)
   {
     desiredHeadingDeg = HeadingSensor.heading(degrees);
   }
+  previousTurnCommandPct = 0.0;
+  filteredHeadingTurnStickPct = 0.0;
+  headingIntegralDegSeconds = 0.0;
+  previousHeadingDeg = desiredHeadingDeg;
+  filteredHeadingRateDegPerSec = 0.0;
+  wasHeadingTurnInputActive = false;
+  wasResetPressed = false;
+  int statusLoopCounter = 0;
 
   // User control code here, inside the loop
   while (1)
   {
+    constexpr double kLoopSeconds = static_cast<double>(kDriverLoopMs) / 1000.0;
+    const double rawFieldForward = Controller1.Axis3.position(pct);
+    const double rawFieldRight = Controller1.Axis4.position(pct);
+    const double rawHeadingTurn = Controller1.Axis1.position(pct);
     const double fieldForward =
-        applyDeadband(Controller1.Axis3.position(pct), kDeadbandPct);
+        applyDeadband(rawFieldForward, kDeadbandPct);
     const double fieldRight =
-        applyDeadband(Controller1.Axis4.position(pct), kDeadbandPct);
-    const double headingForward =
-        applyDeadband(Controller1.Axis2.position(pct), kHeadingStickDeadbandPct);
-    const double headingRight =
-        applyDeadband(Controller1.Axis1.position(pct), kHeadingStickDeadbandPct);
+        applyDeadband(rawFieldRight, kDeadbandPct);
+    const double headingTurnStickTargetPct =
+        applyScaledDeadband(rawHeadingTurn, kHeadingTurnStickDeadbandPct);
+    filteredHeadingTurnStickPct +=
+        (headingTurnStickTargetPct - filteredHeadingTurnStickPct) *
+        kHeadingTurnStickFilterAlpha;
+    const bool headingTurnInputActive =
+        headingSensorReady && std::fabs(filteredHeadingTurnStickPct) >= 0.5;
     const double headingDeg =
         headingSensorReady ? HeadingSensor.heading(degrees) : 0.0;
-
-    if (headingSensorReady && (headingForward != 0.0 || headingRight != 0.0))
-    {
-      desiredHeadingDeg = wrapDegrees360(
-          std::atan2(headingRight, headingForward) * 180.0 / kPi);
-    }
 
     const bool resetPressed = Controller1.ButtonA.pressing();
     if (headingSensorReady && resetPressed && !wasResetPressed)
     {
       HeadingSensor.setHeading(0.0, degrees);
       desiredHeadingDeg = 0.0;
+      previousTurnCommandPct = 0.0;
+      filteredHeadingTurnStickPct = 0.0;
+      headingIntegralDegSeconds = 0.0;
+      previousHeadingDeg = 0.0;
+      filteredHeadingRateDegPerSec = 0.0;
+      wasHeadingTurnInputActive = false;
     }
     wasResetPressed = resetPressed;
 
     double turnCommand = 0.0;
+    double headingErrorDeg = 0.0;
     if (headingSensorReady)
     {
-      const double headingErrorDeg = wrapDegrees180(desiredHeadingDeg - headingDeg);
-      if (std::fabs(headingErrorDeg) > kHeadingHoldEngageErrorDeg)
+      const double rawHeadingRateDegPerSec =
+          wrapDegrees180(headingDeg - previousHeadingDeg) / kLoopSeconds;
+      filteredHeadingRateDegPerSec +=
+          (rawHeadingRateDegPerSec - filteredHeadingRateDegPerSec) *
+          kHeadingDerivativeFilterAlpha;
+      previousHeadingDeg = headingDeg;
+
+      if (headingTurnInputActive)
       {
-        turnCommand = clampValue(headingErrorDeg * kHeadingHoldKp,
-                                 -kMaxHeadingHoldPct,
-                                 kMaxHeadingHoldPct);
+        desiredHeadingDeg = headingDeg;
+        headingIntegralDegSeconds = 0.0;
+        turnCommand =
+            filteredHeadingTurnStickPct * kMaxManualTurnPct / 100.0;
+      }
+      else
+      {
+        if (wasHeadingTurnInputActive)
+        {
+          desiredHeadingDeg = headingDeg;
+          headingIntegralDegSeconds = 0.0;
+          filteredHeadingRateDegPerSec = 0.0;
+          previousTurnCommandPct = 0.0;
+        }
+
+        headingErrorDeg = wrapDegrees180(desiredHeadingDeg - headingDeg);
+        if (std::fabs(headingErrorDeg) <= kHeadingIntegralZoneDeg)
+        {
+          headingIntegralDegSeconds += headingErrorDeg * kLoopSeconds;
+          const double maxIntegralDegSeconds =
+              kMaxHeadingIntegralPct / kHeadingHoldKi;
+          headingIntegralDegSeconds =
+              clampValue(headingIntegralDegSeconds,
+                         -maxIntegralDegSeconds,
+                         maxIntegralDegSeconds);
+        }
+        else
+        {
+          headingIntegralDegSeconds = 0.0;
+        }
+
+        double requestedTurnCommand =
+            headingErrorDeg * kHeadingHoldKp +
+            headingIntegralDegSeconds * kHeadingHoldKi -
+            filteredHeadingRateDegPerSec * kHeadingHoldKd;
+
+        if (std::fabs(headingErrorDeg) <= kHeadingHoldSettleErrorDeg)
+        {
+          requestedTurnCommand = 0.0;
+          headingIntegralDegSeconds = 0.0;
+        }
+
+        requestedTurnCommand = clampValue(requestedTurnCommand,
+                                          -kMaxHeadingHoldPct,
+                                          kMaxHeadingHoldPct);
+        turnCommand =
+            moveToward(previousTurnCommandPct, requestedTurnCommand,
+                       kHeadingTurnSlewPctPerLoop);
+      }
+
+      if (headingTurnInputActive)
+      {
+        headingErrorDeg = 0.0;
       }
     }
     else
     {
-      turnCommand = applyDeadband(Controller1.Axis1.position(pct), kDeadbandPct);
+      turnCommand = applyDeadband(rawHeadingTurn, kDeadbandPct);
     }
+    previousTurnCommandPct = turnCommand;
+    wasHeadingTurnInputActive = headingTurnInputActive;
 
     const double headingRad = headingDeg * kPi / 180.0;
     const double robotForward = headingSensorReady
@@ -279,17 +425,16 @@ void usercontrol(void)
                 backRightCommand);
     }
 
-    Brain.Screen.clearScreen();
-    Brain.Screen.setCursor(1, 1);
-    Brain.Screen.print("Heading: %.1f", headingDeg);
-    Brain.Screen.setCursor(2, 1);
-    if (headingSensorReady)
+    statusLoopCounter += 1;
+    if (statusLoopCounter >= kControllerStatusUpdateLoops)
     {
-      Brain.Screen.print("Target:  %.1f", desiredHeadingDeg);
-    }
-    else
-    {
-      Brain.Screen.print("No inertial fallback");
+      statusLoopCounter = 0;
+      printControllerStatus(
+          headingDeg, desiredHeadingDeg, headingErrorDeg, turnCommand,
+          filteredHeadingTurnStickPct,
+          headingIntegralDegSeconds * kHeadingHoldKi,
+          -filteredHeadingRateDegPerSec * kHeadingHoldKd,
+          headingTurnInputActive, headingSensorReady);
     }
 
     wait(kDriverLoopMs, msec);
