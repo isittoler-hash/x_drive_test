@@ -1,0 +1,19 @@
+{
+	"extension": {
+		"version": "0.8.2026020401",
+		"json": 2
+	},
+	"project": {
+		"name": "x_drive_test",
+		"description": "",
+		"creationDate": "4/7/2026, 8:50:57 AM",
+		"platform": "V5",
+		"language": "cpp",
+		"slot": 1,
+		"sdkVersion": "V5_20240802_15_00_00",
+		"cpp": {
+			"includePath": [],
+			"printf_float": true
+		}
+	}
+}
